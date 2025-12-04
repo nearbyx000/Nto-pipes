@@ -1,151 +1,112 @@
+#!/usr/bin/env python3
+
 import rospy
-import random
+import cv2
 import math
-from gazebo_msgs.srv import SpawnModel
-from geometry_msgs.msg import Pose
+import json
+import numpy as np
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+from clover import srv
 
-# --- КОНСТАНТЫ ЗАДАНИЯ ---
-START_X, START_Y = 1.0, 1.0
-PIPE_RADIUS = 0.1  # Толщина 20см = радиус 0.1м
-TAP_RADIUS = 0.05  # Толщина 10см = радиус 0.05м
-TAP_LENGTH = 0.5   # Длина врезки (визуально достаточно 0.5-1м, чтобы торчала)
-MIN_DIST_BETWEEN_TAPS = 0.75
-
-# Шаблон SDF файла (XML описание модели)
-SDF_WRAPPER = """<?xml version='1.0'?>
-<sdf version='1.6'>
-  <model name='pipeline_system'>
-    <static>true</static>
-    {links}
-  </model>
-</sdf>
-"""
-
-# Шаблон одного звена (цилиндра)
-LINK_TEMPLATE = """
-    <link name='{name}'>
-      <pose frame=''>{x} {y} {z} {roll} {pitch} {yaw}</pose>
-      <visual name='visual'>
-        <geometry>
-          <cylinder>
-            <radius>{radius}</radius>
-            <length>{length}</length>
-          </cylinder>
-        </geometry>
-        <material>
-          <script>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-            <name>Gazebo/{color}</name>
-          </script>
-        </material>
-      </visual>
-      <collision name='collision'>
-        <geometry>
-          <cylinder>
-            <radius>{radius}</radius>
-            <length>{length}</length>
-          </cylinder>
-        </geometry>
-      </collision>
-    </link>
-"""
-
-def get_cylinder_pose(start_x, start_y, length, angle_rad):
-    """
-    Gazebo размещает цилиндр центром в (x,y).
-    Нам нужно найти центр сегмента, зная начало, длину и угол.
-    """
-    center_x = start_x + (length / 2.0) * math.cos(angle_rad)
-    center_y = start_y + (length / 2.0) * math.sin(angle_rad)
-    # Цилиндр в Gazebo по умолчанию стоит вертикально. 
-    # Поворачиваем его на 90 градусов (PI/2) по Pitch, чтобы положить, 
-    # и затем на нужный угол по Yaw (Z).
-    return center_x, center_y, 0.2, 0, 1.5708, angle_rad
-
-def generate_pipeline():
-    rospy.init_node('world_generator')
-    
-    # 1. Генерируем параметры основной трубы
-    total_len = random.uniform(5.0, 10.0)
-    # Разбиваем на 2 сегмента для изгиба (например, 40-60% длины на первый сегмент)
-    len1 = total_len * random.uniform(0.4, 0.6)
-    len2 = total_len - len1
-    
-    # Угол первого сегмента (направляем примерно в центр карты, чтобы не улететь)
-    angle1 = random.uniform(0, 1.57) # 0 to 90 degrees
-    
-    # Угол второго сегмента (изгиб <= 30 градусов)
-    bend = random.radians(random.uniform(-30, 30))
-    angle2 = angle1 + bend
-    
-    links_xml = ""
-    
-    # --- СЕГМЕНТ 1 ---
-    cx1, cy1, cz, cr, cp, cy = get_cylinder_pose(START_X, START_Y, len1, angle1)
-    links_xml += LINK_TEMPLATE.format(name="pipe_seg1", x=cx1, y=cy1, z=cz, roll=cr, pitch=cp, yaw=cy, radius=PIPE_RADIUS, length=len1, color="Yellow")
-    
-    # Конец 1-го сегмента = Начало 2-го
-    end_x1 = START_X + len1 * math.cos(angle1)
-    end_y1 = START_Y + len1 * math.sin(angle1)
-    
-    # --- СЕГМЕНТ 2 ---
-    cx2, cy2, cz, cr, cp, cy = get_cylinder_pose(end_x1, end_y1, len2, angle2)
-    links_xml += LINK_TEMPLATE.format(name="pipe_seg2", x=cx2, y=cy2, z=cz, roll=cr, pitch=cp, yaw=cy, radius=PIPE_RADIUS, length=len2, color="Yellow")
-    
-    # --- ГЕНЕРАЦИЯ ВРЕЗОК ---
-    taps_positions = []
-    attempts = 0
-    while len(taps_positions) < 5 and attempts < 100:
-        attempts += 1
-        # Случайная точка на всей длине трубы
-        dist = random.uniform(0, total_len)
+class MissionNode:
+    def __init__(self):
+        rospy.init_node('oil_mission')
         
-        # Проверка минимального расстояния
-        valid = True
-        for p in taps_positions:
-            if abs(dist - p) < MIN_DIST_BETWEEN_TAPS:
-                valid = False
-                break
-        if not valid: continue
+        self.bridge = CvBridge()
+        self.telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+        self.land = rospy.ServiceProxy('land', srv.Trigger)
+        
+        self.pub_tubes = rospy.Publisher('/tubes', String, queue_size=10)
+        self.sub_cmd = rospy.Subscriber('/mission_cmd', String, self.cmd_callback)
+        self.sub_cam = rospy.Subscriber('main_camera/image_raw', Image, self.img_callback)
+        
+        self.running = False
+        self.detected_taps = []
+        self.current_pos = [0, 0]
+        
+        self.lower_red1 = np.array([0, 100, 100])
+        self.upper_red1 = np.array([10, 255, 255])
+        self.lower_red2 = np.array([170, 100, 100])
+        self.upper_red2 = np.array([180, 255, 255])
+
+    def cmd_callback(self, msg):
+        if msg.data == 'start' and not self.running:
+            self.running = True
+            self.run_mission()
+        elif msg.data == 'stop':
+            self.running = False
+            self.land()
+        elif msg.data == 'kill':
+            self.running = False
+            rospy.ServiceProxy('navigate', srv.Navigate)(x=0, y=0, z=0, frame_id='body', auto_arm=False)
+
+    def img_callback(self, data):
+        if not self.running:
+            return
             
-        taps_positions.append(dist)
-        
-        # Определяем координаты врезки
-        if dist <= len1:
-            # На первом сегменте
-            tap_x = START_X + dist * math.cos(angle1)
-            tap_y = START_Y + dist * math.sin(angle1)
-            tap_angle = angle1 + 1.5708 # Перпендикулярно (+90 град)
-        else:
-            # На втором сегменте
-            rem_dist = dist - len1
-            tap_x = end_x1 + rem_dist * math.cos(angle2)
-            tap_y = end_y1 + rem_dist * math.sin(angle2)
-            tap_angle = angle2 + 1.5708
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
+            hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+            
+            mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
+            mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
+            mask = mask1 + mask2
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area > 500:
+                    telem = self.telemetry(frame_id='aruco_map')
+                    x, y = telem.x, telem.y
+                    
+                    is_new = True
+                    for tap in self.detected_taps:
+                        dist = math.sqrt((tap[0]-x)**2 + (tap[1]-y)**2)
+                        if dist < 1.0:
+                            is_new = False
+                            break
+                    
+                    if is_new:
+                        self.detected_taps.append([round(x, 2), round(y, 2)])
+                        
+            msg_data = {
+                'drone': [round(self.current_pos[0], 2), round(self.current_pos[1], 2)],
+                'taps': self.detected_taps
+            }
+            self.pub_tubes.publish(json.dumps(msg_data))
+            
+        except Exception:
+            pass
 
-        # Добавляем врезку (смещаем центр врезки чуть вбок, чтобы она торчала из трубы)
-        # Смещение на (TAP_LENGTH/2), чтобы она начиналась от центра трубы
-        offset = TAP_LENGTH / 2.0
-        final_tap_x = tap_x + offset * math.cos(tap_angle)
-        final_tap_y = tap_y + offset * math.sin(tap_angle)
+    def run_mission(self):
+        self.navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)
+        rospy.sleep(5)
         
-        links_xml += LINK_TEMPLATE.format(
-            name=f"tap_{len(taps_positions)}",
-            x=final_tap_x, y=final_tap_y, z=cz, # Высота та же
-            roll=0, pitch=1.5708, yaw=tap_angle,
-            radius=TAP_RADIUS, length=TAP_LENGTH, color="Red"
-        )
+        self.navigate(x=1, y=1, z=1.5, speed=1, frame_id='aruco_map')
+        rospy.sleep(4)
         
-    # --- ОТПРАВКА В GAZEBO ---
-    final_sdf = SDF_WRAPPER.format(links=links_xml)
-    
-    rospy.wait_for_service('/gazebo/spawn_sdf_model')
-    try:
-        spawn_model = rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)
-        spawn_model("pipeline_system", final_sdf, "", Pose(), "world")
-        rospy.loginfo("Трубопровод успешно сгенерирован!")
-    except rospy.ServiceException as e:
-        rospy.logerr("Ошибка спавна: %s", e)
+        points = [
+            (3, 1.5), (5, 2), (7, 2.5), (9, 3) 
+        ]
+        
+        for p in points:
+            if not self.running: break
+            self.navigate(x=p[0], y=p[1], z=1.5, speed=0.8, frame_id='aruco_map')
+            
+            telem = self.telemetry(frame_id='aruco_map')
+            self.current_pos = [telem.x, telem.y]
+            rospy.sleep(3)
+
+        if self.running:
+            self.navigate(x=0, y=0, z=1.5, speed=1, frame_id='aruco_map')
+            rospy.sleep(5)
+            self.land()
+            self.running = False
 
 if __name__ == '__main__':
-    generate_pipeline()
+    node = MissionNode()
+    rospy.spin()
