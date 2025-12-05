@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 from flask import Flask, render_template_string, jsonify
 import rospy, threading, json
 from std_msgs.msg import String
