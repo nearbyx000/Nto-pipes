@@ -19,7 +19,7 @@ def main():
     l1 = total * random.uniform(0.4, 0.6)
     l2 = total - l1
     a1 = random.uniform(0, 1.57)
-    a2 = a1 + random.radians(random.uniform(-30, 30))
+    a2 = a1 + math.radians(random.uniform(-30, 30))
 
     cx, cy, cz, cr, cp, cyw = get_pose(1, 1, l1, a1)
     links += LINK_TMPL.format(name="s1", x=cx, y=cy, z=cz, r=cr, p=cp, yw=cyw, rad=0.1, len=l1, col="Yellow")

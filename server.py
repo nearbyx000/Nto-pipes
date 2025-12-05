@@ -29,12 +29,9 @@ def c(c): pub.publish(c); return "ok"
 @app.route('/data')
 def dt(): return jsonify(d)
 
-def ros():
-    global pub
-    rospy.init_node('web'); pub = rospy.Publisher('/mission_cmd', String, queue_size=1)
-    rospy.Subscriber('/tubes', String, lambda m: d.update(json.loads(m.data)))
-    rospy.spin()
-
 if __name__ == '__main__':
-    threading.Thread(target=ros).start()
+    rospy.init_node('web', disable_signals=True)
+    pub = rospy.Publisher('/mission_cmd', String, queue_size=1)
+    rospy.Subscriber('/tubes', String, lambda m: d.update(json.loads(m.data)))
+    
     app.run(host='0.0.0.0', port=5000)
