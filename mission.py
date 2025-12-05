@@ -8,136 +8,60 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from clover import srv
 
-class MissionNode:
+class Node:
     def __init__(self):
-        rospy.init_node('oil_mission')
-        
-        self.bridge = CvBridge()
-        self.telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
-        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+        rospy.init_node('mission')
+        self.br = CvBridge()
+        self.nav = rospy.ServiceProxy('navigate', srv.Navigate)
+        self.telem = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
         self.land = rospy.ServiceProxy('land', srv.Trigger)
+        self.pub = rospy.Publisher('/tubes', String, queue_size=10)
         
-        self.pub_tubes = rospy.Publisher('/tubes', String, queue_size=10)
-        self.sub_cmd = rospy.Subscriber('/mission_cmd', String, self.cmd_callback)
-        self.sub_cam = rospy.Subscriber('main_camera/image_raw', Image, self.img_callback)
+        rospy.Subscriber('/mission_cmd', String, self.cmd_cb)
+        rospy.Subscriber('main_camera/image_raw', Image, self.img_cb)
         
-        self.running = False
-        self.detected_taps = []
-        self.current_pos = [0, 0]
-        
-        self.lower_red1 = np.array([0, 100, 100])
-        self.upper_red1 = np.array([10, 255, 255])
-        self.lower_red2 = np.array([170, 100, 100])
-        self.upper_red2 = np.array([180, 255, 255])
+        self.run = False
+        self.taps = []
+        self.pos = [0, 0]
 
-    def cmd_callback(self, msg):
-        if msg.data == 'start' and not self.running:
-            self.running = True
-            self.run_mission()
-        elif msg.data == 'stop':
-            self.running = False
-            self.land()
-        elif msg.data == 'kill':
-            self.running = False
-            rospy.ServiceProxy('navigate', srv.Navigate)(x=0, y=0, z=0, frame_id='body', auto_arm=False)
+    def cmd_cb(self, msg):
+        if msg.data == 'start': self.run = True; self.start_mission()
+        elif msg.data == 'stop': self.run = False; self.land()
+        elif msg.data == 'kill': self.run = False; self.nav(x=0, y=0, z=0, frame_id='body', auto_arm=False)
 
-    def img_callback(self, data):
-        if not self.running:
-            return
-            
+    def img_cb(self, data):
+        if not self.run: return
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-            hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+            cv_img = self.br.imgmsg_to_cv2(data, 'bgr8')
+            hsv = cv2.cvtColor(cv_img, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, (0, 100, 100), (10, 255, 255)) + cv2.inRange(hsv, (170, 100, 100), (180, 255, 255))
             
-            mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
-            mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
-            mask = mask1 + mask2
+            for cnt in cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)[0]:
+                if cv2.contourArea(cnt) > 300:
+                    t = self.telem(frame_id='aruco_map')
+                    if all(math.hypot(t.x-p[0], t.y-p[1]) > 1.0 for p in self.taps):
+                        self.taps.append([round(t.x, 2), round(t.y, 2)])
             
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > 500:
-                    telem = self.telemetry(frame_id='aruco_map')
-                    x, y = telem.x, telem.y
-                    
-                    is_new = True
-                    for tap in self.detected_taps:
-                        dist = math.sqrt((tap[0]-x)**2 + (tap[1]-y)**2)
-                        if dist < 1.0:
-                            is_new = False
-                            break
-                    
-                    if is_new:
-                        self.detected_taps.append([round(x, 2), round(y, 2)])
-                        
-            msg_data = {
-                'drone': [round(self.current_pos[0], 2), round(self.current_pos[1], 2)],
-                'taps': self.detected_taps
-            }
-            self.pub_tubes.publish(json.dumps(msg_data))
-            
-        except Exception:
-            pass
+            self.pub.publish(json.dumps({'drone': [round(self.telem(frame_id='aruco_map').x, 2), round(self.telem(frame_id='aruco_map').y, 2)], 'taps': self.taps}))
+        except: pass
 
-    def run_mission(self):
-        # 1. Взлет
-        self.navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)
-        rospy.sleep(5)
+    def start_mission(self):
+        self.nav(x=0, y=0, z=2, frame_id='body', auto_arm=True); rospy.sleep(5)
+        self.nav(x=1, y=1, z=2, speed=1, frame_id='aruco_map'); rospy.sleep(4)
         
-        # 2. Выход на начало зоны поиска (Точка 1,1 - начало трубы)
-        # Поднимаемся чуть выше (2м), чтобы захватить больше области камерой
-        self.navigate(x=1, y=1, z=2.0, speed=1, frame_id='aruco_map')
-        rospy.sleep(4)
-        
-        # 3. Генерация точек для "Змейки" (Сканирование области)
-        # Мы предполагаем, что труба длиной до 10м находится в секторе X+ Y+
-        waypoints = []
-        
-        # Сканируем область 8x8 метров с шагом 2 метра
-        # Это гарантирует, что мы пересечем трубу, как бы она ни легла
-        scan_width = 10 
-        step = 1.5 # Шаг между проходами (зависит от высоты и угла обзора камеры)
-        
-        current_x = 1.0
-        direction = 1 # 1 = вверх, -1 = вниз
-        
-        while current_x < 11.0: # Летим до X=11
-            # Точка начала полосы
-            y_start = 1.0 if direction == 1 else 10.0
-            # Точка конца полосы
-            y_end = 10.0 if direction == 1 else 1.0
-            
-            waypoints.append((current_x, y_start))
-            waypoints.append((current_x, y_end))
-            
-            current_x += step
-            direction *= -1 # Меняем направление для следующей полосы
+        x, dr = 1.0, 1
+        while x < 11.0 and self.run:
+            pts = [(x, 1.0), (x, 10.0)] if dr == 1 else [(x, 10.0), (x, 1.0)]
+            for p in pts:
+                self.nav(x=p[0], y=p[1], z=2, speed=1, frame_id='aruco_map')
+                while self.run:
+                    t = self.telem(frame_id='aruco_map')
+                    if math.hypot(t.x-p[0], t.y-p[1]) < 0.3: break
+                    rospy.sleep(0.1)
+            x += 1.5; dr *= -1
 
-        # 4. Выполнение полета по точкам
-        for p in waypoints:
-            if not self.running: break
-            
-            # Летим к точке
-            self.navigate(x=p[0], y=p[1], z=2.0, speed=1.0, frame_id='aruco_map')
-            
-            # Ждем пока долетит (простая проверка расстояния)
-            while self.running:
-                telem = self.telemetry(frame_id='aruco_map')
-                dist = math.sqrt((telem.x - p[0])**2 + (telem.y - p[1])**2)
-                self.current_pos = [telem.x, telem.y] # Обновляем позицию для веба
-                
-                # Если подлетели ближе 0.3м - следующая точка
-                if dist < 0.3:
-                    break
-                rospy.sleep(0.2)
+        if self.run: self.nav(x=0, y=0, z=1.5, speed=1.5, frame_id='aruco_map'); rospy.sleep(7); self.land()
 
-        # 5. Возврат домой
-        if self.running:
-            self.navigate(x=0, y=0, z=1.5, speed=1.5, frame_id='aruco_map')
-            rospy.sleep(7)
-            self.land()
-            self.running = False
 if __name__ == '__main__':
-    node = MissionNode()
+    Node()
     rospy.spin()
