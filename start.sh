@@ -4,6 +4,8 @@ source /home/user/catkin_ws/devel/setup.bash
 
 chmod +x world-gen.py mission.py server.py
 
+pip install -r requirements.txt
+
 roslaunch clover main_camera.launch &
 P1=$!
 sleep 15

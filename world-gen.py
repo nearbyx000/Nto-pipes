@@ -43,7 +43,7 @@ def main():
             tx, ty, ta = ex1 + rem*math.cos(a2), ey1 + rem*math.sin(a2), a2 + 1.5708
             
         fx, fy = tx + 0.25*math.cos(ta), ty + 0.25*math.sin(ta)
-        links += LINK_TMPL.format(name=f"t{i}", x=fx, y=fy, z=0.2, r=0, p=1.5708, yw=ta, rad=0.05, len=0.5, col="Red")
+        links += LINK_TMPL.format(name="t{}".format(i), x=fx, y=fy, z=0.2, r=0, p=1.5708, yw=ta, rad=0.05, len=0.5, col="Red")
 
     rospy.wait_for_service('/gazebo/spawn_sdf_model')
     rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)("pipeline_system", SDF_WRAPPER.format(links=links), "", Pose(), "world")

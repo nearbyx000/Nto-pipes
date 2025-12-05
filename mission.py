@@ -7,6 +7,7 @@ import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from clover import srv
 
 class Node:
@@ -15,7 +16,7 @@ class Node:
         self.br = CvBridge()
         self.nav = rospy.ServiceProxy('navigate', srv.Navigate)
         self.telem = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
-        self.land = rospy.ServiceProxy('land', srv.Trigger)
+        self.land = rospy.ServiceProxy('land', Trigger)
         self.pub = rospy.Publisher('/tubes', String, queue_size=10)
         
         rospy.Subscriber('/mission_cmd', String, self.cmd_cb)
