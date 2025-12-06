@@ -1,24 +1,35 @@
+#!/bin/bash
 
+# Exit on error
+set -e
+
+# Load ROS Environment
 source /opt/ros/melodic/setup.bash
 source /home/user/catkin_ws/devel/setup.bash
 
-chmod +x world-gen.py mission.py server.py
+echo ">>> STARTING PIPELINE INSPECTION SYSTEM <<<"
 
-pip install -r requirements.txt
+# 1. Start core ROS services (Simulated Drone)
+# Note: 'launch_sim_inside.sh' handles Gazebo + Drone spawn.
+# We assume the simulator is ALREADY RUNNING via that script.
+# If not, this script will fail to find ROS master.
 
-roslaunch clover main_camera.launch &
-P1=$!
-sleep 15
+# 2. Generate World (Pipeline + Taps)
+echo ">>> Generating World and Setting Params..."
+python ./world-gen.py
 
-roslaunch clover aruco.launch &
-P2=$!
-sleep 5
+# 3. Start Mission Control Node
+echo ">>> Starting Mission Control..."
+python ./mission.py &
+MISSION_PID=$!
 
-./world-gen.py
-./server.py &
-P3=$!
-./mission.py &
-P4=$!
+# 4. Start Web Interface
+echo ">>> Starting Web Interface..."
+python ./server.py &
+SERVER_PID=$!
 
-trap "kill $P1 $P2 $P3 $P4; exit" SIGINT
+echo ">>> SYSTEM READY. Access UI at http://localhost:5001 <<<"
+
+# Cleanup
+trap "kill $MISSION_PID $SERVER_PID; exit" SIGINT SIGTERM
 wait
