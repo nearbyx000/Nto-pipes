@@ -1,143 +1,171 @@
 import rospy
-import cv2
 import math
 import json
-import numpy as np
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
+import threading
 from std_msgs.msg import String
 from clover import srv
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import PoseStamped # Import PoseStamped
 
-class MissionNode:
+class MissionControl:
     def __init__(self):
-        rospy.init_node('oil_mission')
+        print("STARTING MISSION NODE")
+        rospy.init_node('mission_control')
         
-        self.bridge = CvBridge()
-        self.telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
-        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
-        self.land = rospy.ServiceProxy('land', srv.Trigger)
-        
-        self.pub_tubes = rospy.Publisher('/tubes', String, queue_size=10)
-        self.sub_cmd = rospy.Subscriber('/mission_cmd', String, self.cmd_callback)
-        self.sub_cam = rospy.Subscriber('main_camera/image_raw', Image, self.img_callback)
-        
-        self.running = False
-        self.detected_taps = []
-        self.current_pos = [0, 0]
-        
-        self.lower_red1 = np.array([0, 100, 100])
-        self.upper_red1 = np.array([10, 255, 255])
-        self.lower_red2 = np.array([170, 100, 100])
-        self.upper_red2 = np.array([180, 255, 255])
+        # --- Services ---
+        rospy.loginfo("Waiting for /navigate service...")
+        rospy.wait_for_service('navigate')
+        self.nav = rospy.ServiceProxy('navigate', srv.Navigate)
+        rospy.loginfo("/navigate service available.")
 
-    def cmd_callback(self, msg):
-        if msg.data == 'start' and not self.running:
-            self.running = True
-            self.run_mission()
-        elif msg.data == 'stop':
+        # Do not wait for get_telemetry service, we will subscribe directly
+        rospy.loginfo("Waiting for /land service...")
+        rospy.wait_for_service('land')
+        self.land = rospy.ServiceProxy('land', Trigger)
+        rospy.loginfo("/land service available.")
+        
+        # --- Pub/Sub ---
+        self.state_pub = rospy.Publisher('/tubes', String, queue_size=10)
+        rospy.Subscriber('/mission_cmd', String, self.handle_command)
+        rospy.Subscriber('/mavros/local_position/pose', PoseStamped, self._pose_cb) # Subscribe to MAVROS pose
+        
+        # --- State ---
+        self.running = False
+        self.mission_thread = None
+        self.ground_truth_taps = []
+        self.detected_taps = [] # List of [x, y]
+        self.current_pose = None # Stores latest PoseStamped message
+        
+        # Load Ground Truth from Params (set by world-gen.py)
+        for _ in range(10):
+            if rospy.has_param('/pipeline/taps'):
+                self.ground_truth_taps = rospy.get_param('/pipeline/taps')
+                break
+            rospy.sleep(1)
+            
+        rospy.loginfo("Mission Node Ready. Ground Truth Taps: {}".format(len(self.ground_truth_taps)))
+
+    def _pose_cb(self, msg):
+        """Callback for /mavros/local_position/pose topic"""
+        self.current_pose = msg
+        
+    def handle_command(self, msg):
+        cmd = msg.data
+        rospy.loginfo("Received command: {}".format(cmd))
+        
+        if cmd == 'start':
+            if not self.running:
+                self.running = True
+                self.mission_thread = threading.Thread(target=self.run_mission_logic)
+                self.mission_thread.start()
+        
+        elif cmd == 'stop':
+            rospy.loginfo("Received command: stop. Setting self.running to False.")
             self.running = False
             self.land()
-        elif msg.data == 'kill':
+            
+        elif cmd == 'kill':
+            rospy.loginfo("Received command: kill. Setting self.running to False.")
             self.running = False
-            rospy.ServiceProxy('navigate', srv.Navigate)(x=0, y=0, z=0, frame_id='body', auto_arm=False)
+            # Emergency drop: disarm immediately
+            self.nav(x=0, y=0, z=0, frame_id='body', auto_arm=False)
 
-    def img_callback(self, data):
-        if not self.running:
+    def publish_state(self):
+        """Publishes current drone pos and list of found taps to Web UI"""
+        if self.current_pose is None:
+            rospy.logwarn("Telemetry not yet available for publishing.")
             return
-            
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-            hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-            
-            mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
-            mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
-            mask = mask1 + mask2
-            
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > 500:
-                    telem = self.telemetry(frame_id='aruco_map')
-                    x, y = telem.x, telem.y
-                    
-                    is_new = True
-                    for tap in self.detected_taps:
-                        dist = math.sqrt((tap[0]-x)**2 + (tap[1]-y)**2)
-                        if dist < 1.0:
-                            is_new = False
-                            break
-                    
-                    if is_new:
-                        self.detected_taps.append([round(x, 2), round(y, 2)])
-                        
-            msg_data = {
-                'drone': [round(self.current_pos[0], 2), round(self.current_pos[1], 2)],
-                'taps': self.detected_taps
-            }
-            self.pub_tubes.publish(json.dumps(msg_data))
-            
-        except Exception:
-            pass
 
-    def run_mission(self):
-        # 1. Взлет
-        self.navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)
+        drone_x = self.current_pose.pose.position.x
+        drone_y = self.current_pose.pose.position.y
+        
+        state = {
+            'drone': [round(drone_x, 2), round(drone_y, 2)],
+            'taps': self.detected_taps
+        }
+        self.state_pub.publish(json.dumps(state))
+
+    def check_for_taps(self):
+        """Simulates camera detection based on proximity"""
+        if self.current_pose is None:
+            return
+
+        drone_x = self.current_pose.pose.position.x
+        drone_y = self.current_pose.pose.position.y
+        
+        for gt_tap in self.ground_truth_taps:
+            dist = math.hypot(drone_x - gt_tap[0], drone_y - gt_tap[1])
+            
+            # If within 1.0m, consider it "seen"
+            if dist < 1.0:
+                # Check if we already recorded this one (avoid duplicates)
+                already_found = False
+                for dt in self.detected_taps:
+                    if math.hypot(dt[0] - gt_tap[0], dt[1] - gt_tap[1]) < 0.5:
+                        already_found = True
+                        break
+                
+                if not already_found:
+                    rospy.loginfo("Visual Detection! Tap at [{:.2f}, {:.2f}]".format(gt_tap[0], gt_tap[1]))
+                    self.detected_taps.append(gt_tap)
+
+    def navigate_and_scan(self, x, y, z=2.0, speed=1.0, frame_id='map', tolerance=0.3):
+        """Blocking navigation that updates state while flying"""
+        if not self.running: return
+
+        self.nav(x=x, y=y, z=z, speed=speed, frame_id=frame_id)
+        
+        while self.running:
+            rospy.loginfo("DEBUG: navigate_and_scan loop checking self.running flag.")
+            if self.current_pose is None:
+                rospy.logwarn("Waiting for telemetry for navigation check...")
+                rospy.sleep(0.5)
+                continue
+
+            drone_x = self.current_pose.pose.position.x
+            drone_y = self.current_pose.pose.position.y
+            
+            # 1. Update Detection
+            self.check_for_taps()
+            
+            # 2. Publish State
+            self.publish_state()
+            
+            # 3. Check arrival
+            dist_to_target = math.hypot(drone_x - x, drone_y - y)
+            if dist_to_target < tolerance:
+                break
+                
+            rospy.sleep(0.2)
+
+    def run_mission_logic(self):
+        rospy.loginfo("Mission Started. Taking off...")
+        
+        # Arm and Takeoff
+        self.nav(x=0, y=0, z=2, frame_id='body', auto_arm=True)
         rospy.sleep(5)
         
-        # 2. Выход на начало зоны поиска (Точка 1,1 - начало трубы)
-        # Поднимаемся чуть выше (2м), чтобы захватить больше области камерой
-        self.navigate(x=1, y=1, z=2.0, speed=1, frame_id='aruco_map')
-        rospy.sleep(4)
+        # Define Scan Pattern (Simple Zig-Zag)
+        # Area: X from 0 to 12, Y from 0 to 12
+        waypoints = [
+            [1, 1], [1, 10], 
+            [3, 10], [3, 1],
+            [5, 1], [5, 10],
+            [7, 10], [7, 1],
+            [9, 1], [9, 10],
+            [11, 10], [11, 1]
+        ]
         
-        # 3. Генерация точек для "Змейки" (Сканирование области)
-        # Мы предполагаем, что труба длиной до 10м находится в секторе X+ Y+
-        waypoints = []
-        
-        # Сканируем область 8x8 метров с шагом 2 метра
-        # Это гарантирует, что мы пересечем трубу, как бы она ни легла
-        scan_width = 10 
-        step = 1.5 # Шаг между проходами (зависит от высоты и угла обзора камеры)
-        
-        current_x = 1.0
-        direction = 1 # 1 = вверх, -1 = вниз
-        
-        while current_x < 11.0: # Летим до X=11
-            # Точка начала полосы
-            y_start = 1.0 if direction == 1 else 10.0
-            # Точка конца полосы
-            y_end = 10.0 if direction == 1 else 1.0
-            
-            waypoints.append((current_x, y_start))
-            waypoints.append((current_x, y_end))
-            
-            current_x += step
-            direction *= -1 # Меняем направление для следующей полосы
-
-        # 4. Выполнение полета по точкам
-        for p in waypoints:
+        for wp in waypoints:
             if not self.running: break
+            rospy.loginfo("Navigating to waypoint: {}".format(wp))
+            self.navigate_and_scan(wp[0], wp[1])
             
-            # Летим к точке
-            self.navigate(x=p[0], y=p[1], z=2.0, speed=1.0, frame_id='aruco_map')
-            
-            # Ждем пока долетит (простая проверка расстояния)
-            while self.running:
-                telem = self.telemetry(frame_id='aruco_map')
-                dist = math.sqrt((telem.x - p[0])**2 + (telem.y - p[1])**2)
-                self.current_pos = [telem.x, telem.y] # Обновляем позицию для веба
-                
-                # Если подлетели ближе 0.3м - следующая точка
-                if dist < 0.3:
-                    break
-                rospy.sleep(0.2)
+        rospy.loginfo("Scan Complete. Returning to Base.")
+        self.navigate_and_scan(0, 0)
+        self.land()
+        self.running = False
 
-        # 5. Возврат домой
-        if self.running:
-            self.navigate(x=0, y=0, z=1.5, speed=1.5, frame_id='aruco_map')
-            rospy.sleep(7)
-            self.land()
-            self.running = False
 if __name__ == '__main__':
-    node = MissionNode()
+    MissionControl()
     rospy.spin()

@@ -29,6 +29,7 @@ def main():
     links += LINK_TMPL.format(name="s2", x=cx, y=cy, z=cz, r=cr, p=cp, yw=cyw, rad=0.1, len=l2, col="Yellow")
 
     taps = []
+    tap_coords = []
     for i in range(5):
         while True:
             d = random.uniform(0, total)
@@ -43,8 +44,10 @@ def main():
             tx, ty, ta = ex1 + rem*math.cos(a2), ey1 + rem*math.sin(a2), a2 + 1.5708
             
         fx, fy = tx + 0.25*math.cos(ta), ty + 0.25*math.sin(ta)
+        tap_coords.append([fx, fy])
         links += LINK_TMPL.format(name="t{}".format(i), x=fx, y=fy, z=0.2, r=0, p=1.5708, yw=ta, rad=0.05, len=0.5, col="Red")
 
+    rospy.set_param('/pipeline/taps', tap_coords)
     rospy.wait_for_service('/gazebo/spawn_sdf_model')
     rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)("pipeline_system", SDF_WRAPPER.format(links=links), "", Pose(), "world")
 
