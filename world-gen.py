@@ -1,112 +1,52 @@
-#!/usr/bin/env python3
-
+#!/usr/bin/env python
 import rospy
-import cv2
+import random
 import math
-import json
-import numpy as np
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from clover import srv
+from gazebo_msgs.srv import SpawnModel
+from geometry_msgs.msg import Pose
 
-class MissionNode:
-    def __init__(self):
-        rospy.init_node('oil_mission')
-        
-        self.bridge = CvBridge()
-        self.telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
-        self.navigate = rospy.ServiceProxy('navigate', srv.Navigate)
-        self.land = rospy.ServiceProxy('land', srv.Trigger)
-        
-        self.pub_tubes = rospy.Publisher('/tubes', String, queue_size=10)
-        self.sub_cmd = rospy.Subscriber('/mission_cmd', String, self.cmd_callback)
-        self.sub_cam = rospy.Subscriber('main_camera/image_raw', Image, self.img_callback)
-        
-        self.running = False
-        self.detected_taps = []
-        self.current_pos = [0, 0]
-        
-        self.lower_red1 = np.array([0, 100, 100])
-        self.upper_red1 = np.array([10, 255, 255])
-        self.lower_red2 = np.array([170, 100, 100])
-        self.upper_red2 = np.array([180, 255, 255])
+SDF_WRAPPER = """<?xml version='1.0'?><sdf version='1.6'><model name='pipeline_system'><static>true</static>{links}</model></sdf>"""
+LINK_TMPL = """<link name='{name}'><pose>{x} {y} {z} {r} {p} {yw}</pose><visual name='v'><geometry><cylinder><radius>{rad}</radius><length>{len}</length></cylinder></geometry><material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/{col}</name></script></material></visual><collision name='c'><geometry><cylinder><radius>{rad}</radius><length>{len}</length></cylinder></geometry></collision></link>"""
 
-    def cmd_callback(self, msg):
-        if msg.data == 'start' and not self.running:
-            self.running = True
-            self.run_mission()
-        elif msg.data == 'stop':
-            self.running = False
-            self.land()
-        elif msg.data == 'kill':
-            self.running = False
-            rospy.ServiceProxy('navigate', srv.Navigate)(x=0, y=0, z=0, frame_id='body', auto_arm=False)
+def get_pose(sx, sy, l, a):
+    return sx + (l/2)*math.cos(a), sy + (l/2)*math.sin(a), 0.2, 0, 1.5708, a
 
-    def img_callback(self, data):
-        if not self.running:
-            return
-            
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(data, 'bgr8')
-            hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-            
-            mask1 = cv2.inRange(hsv, self.lower_red1, self.upper_red1)
-            mask2 = cv2.inRange(hsv, self.lower_red2, self.upper_red2)
-            mask = mask1 + mask2
-            
-            contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                if area > 500:
-                    telem = self.telemetry(frame_id='aruco_map')
-                    x, y = telem.x, telem.y
-                    
-                    is_new = True
-                    for tap in self.detected_taps:
-                        dist = math.sqrt((tap[0]-x)**2 + (tap[1]-y)**2)
-                        if dist < 1.0:
-                            is_new = False
-                            break
-                    
-                    if is_new:
-                        self.detected_taps.append([round(x, 2), round(y, 2)])
-                        
-            msg_data = {
-                'drone': [round(self.current_pos[0], 2), round(self.current_pos[1], 2)],
-                'taps': self.detected_taps
-            }
-            self.pub_tubes.publish(json.dumps(msg_data))
-            
-        except Exception:
-            pass
+def main():
+    rospy.init_node('world_gen')
+    links = ""
+    
+    total = random.uniform(5, 10)
+    l1 = total * random.uniform(0.4, 0.6)
+    l2 = total - l1
+    a1 = random.uniform(0, 1.57)
+    a2 = a1 + math.radians(random.uniform(-30, 30))
 
-    def run_mission(self):
-        self.navigate(x=0, y=0, z=1.5, frame_id='body', auto_arm=True)
-        rospy.sleep(5)
-        
-        self.navigate(x=1, y=1, z=1.5, speed=1, frame_id='aruco_map')
-        rospy.sleep(4)
-        
-        points = [
-            (3, 1.5), (5, 2), (7, 2.5), (9, 3) 
-        ]
-        
-        for p in points:
-            if not self.running: break
-            self.navigate(x=p[0], y=p[1], z=1.5, speed=0.8, frame_id='aruco_map')
-            
-            telem = self.telemetry(frame_id='aruco_map')
-            self.current_pos = [telem.x, telem.y]
-            rospy.sleep(3)
+    cx, cy, cz, cr, cp, cyw = get_pose(1, 1, l1, a1)
+    links += LINK_TMPL.format(name="s1", x=cx, y=cy, z=cz, r=cr, p=cp, yw=cyw, rad=0.1, len=l1, col="Yellow")
+    
+    ex1, ey1 = 1 + l1*math.cos(a1), 1 + l1*math.sin(a1)
+    cx, cy, cz, cr, cp, cyw = get_pose(ex1, ey1, l2, a2)
+    links += LINK_TMPL.format(name="s2", x=cx, y=cy, z=cz, r=cr, p=cp, yw=cyw, rad=0.1, len=l2, col="Yellow")
 
-        if self.running:
-            self.navigate(x=0, y=0, z=1.5, speed=1, frame_id='aruco_map')
-            rospy.sleep(5)
-            self.land()
-            self.running = False
+    taps = []
+    for i in range(5):
+        while True:
+            d = random.uniform(0, total)
+            if all(abs(d - t) > 0.75 for t in taps):
+                taps.append(d)
+                break
+        
+        if d <= l1:
+            tx, ty, ta = 1 + d*math.cos(a1), 1 + d*math.sin(a1), a1 + 1.5708
+        else:
+            rem = d - l1
+            tx, ty, ta = ex1 + rem*math.cos(a2), ey1 + rem*math.sin(a2), a2 + 1.5708
+            
+        fx, fy = tx + 0.25*math.cos(ta), ty + 0.25*math.sin(ta)
+        links += LINK_TMPL.format(name="t{}".format(i), x=fx, y=fy, z=0.2, r=0, p=1.5708, yw=ta, rad=0.05, len=0.5, col="Red")
+
+    rospy.wait_for_service('/gazebo/spawn_sdf_model')
+    rospy.ServiceProxy('/gazebo/spawn_sdf_model', SpawnModel)("pipeline_system", SDF_WRAPPER.format(links=links), "", Pose(), "world")
 
 if __name__ == '__main__':
-    node = MissionNode()
-    rospy.spin()
+    main()
